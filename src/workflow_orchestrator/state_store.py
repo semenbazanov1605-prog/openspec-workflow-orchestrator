@@ -149,6 +149,24 @@ class StateStore:
             raise StateStoreError(f"Cannot read workflow events at {path}: {exc}") from exc
         return events
 
+    def list_changes(self) -> list[str]:
+        """Return change IDs that have a persisted state file."""
+        if not self.runs_root.exists():
+            return []
+        changes: list[str] = []
+        try:
+            for candidate in self.runs_root.iterdir():
+                if not candidate.is_dir() or not (candidate / "state.json").is_file():
+                    continue
+                try:
+                    self._validate_change_id(candidate.name)
+                except ValueError:
+                    continue
+                changes.append(candidate.name)
+        except OSError as exc:
+            raise StateStoreError(f"Cannot list workflow runs under {self.runs_root}: {exc}") from exc
+        return sorted(changes)
+
     def _atomic_write_state(self, path: Path, state: WorkflowState) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(state.to_dict(), indent=2, ensure_ascii=False, sort_keys=True) + "\n"

@@ -1,2 +1,3 @@
-"""OpenSpec Workflow Orchestrator compatibility spike."""
-__version__ = "0.2.0"
+"""OpenSpec Workflow Orchestrator."""
+
+__version__ = "0.3.0"
