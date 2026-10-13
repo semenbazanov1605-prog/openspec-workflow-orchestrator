@@ -254,6 +254,82 @@ def finalize_approval_decision(repository: Path, change_id: str) -> dict[str, An
     return {"command": "approval-consumed", "state": updated.to_dict()}
 
 
+
+def handle_gigacode_result(repository: Path, change_id: str, result: Any) -> dict[str, Any]:
+    """Persist a GigaCode turn and convert reported permission denials to approval requests.
+
+    This is the adapter-to-workflow boundary: a final CLI event with
+    ``is_error=false`` is still treated as incomplete when permission_denials
+    is non-empty. It records the session id before creating a pending request.
+    It does not resume the session or grant permissions by itself.
+    """
+    repo, store, state = _load_state(repository, change_id)
+    if state.status not in {WorkflowStatus.RUNNING, WorkflowStatus.VERIFYING}:
+        raise ApprovalCommandError(
+            "A GigaCode result can only be handled for a RUNNING or VERIFYING workflow; "
+            f"current status is {state.status.value}"
+        )
+
+    session_id = getattr(result, "session_id", None)
+    denials = tuple(getattr(result, "permission_denials", ()) or ())
+    state.gigacode_session_id = session_id or state.gigacode_session_id
+    state.last_result = {
+        "kind": "gigacode_turn",
+        "ok": bool(getattr(result, "ok", False)),
+        "is_error": getattr(result, "is_error", None),
+        "session_id": state.gigacode_session_id,
+        "permission_denial_count": len(denials),
+        "error": getattr(result, "error", None),
+    }
+    try:
+        store.save(
+            state,
+            event_type="gigacode_turn_received",
+            details={
+                "ok": bool(getattr(result, "ok", False)),
+                "session_id": state.gigacode_session_id,
+                "permission_denial_count": len(denials),
+            },
+        )
+    except (StateStoreError, OSError) as exc:
+        raise ApprovalCommandError(str(exc)) from exc
+
+    if denials:
+        denial = denials[0]
+        tool_name = str(denial.get("tool_name") or "unknown")
+        tool_input = denial.get("tool_input") if isinstance(denial.get("tool_input"), dict) else {}
+        if tool_name in {"write_file", "edit_file", "replace_in_file", "apply_patch"}:
+            action = ApprovalAction.FILE_EDIT
+        elif tool_name.lower() in {"bash", "shell", "run_command", "execute_command"}:
+            action = ApprovalAction.COMMAND
+        else:
+            action = ApprovalAction.UNKNOWN
+        path = tool_input.get("file_path") or tool_input.get("path")
+        description = f"GigaCode tool '{tool_name}' was denied"
+        if path:
+            description += f" for path {path}"
+        if len(denials) > 1:
+            description += f" ({len(denials)} denied operations in this turn)"
+        approval = request_approval(
+            repo,
+            change_id,
+            action=action,
+            description=description,
+            source="gigacode",
+        )
+        approval["gigacode_session_id"] = state.gigacode_session_id
+        approval["permission_denials"] = list(denials)
+        return approval
+
+    return {
+        "command": "gigacode-result",
+        "change_id": change_id,
+        "ok": bool(getattr(result, "ok", False)),
+        "needs_approval": False,
+        "state": state.to_dict(),
+        "notice": "GigaCode result persisted. Successful execution still requires workflow verification.",
+    }
+
 def _load_state(repository: Path, change_id: str) -> tuple[Path, StateStore, WorkflowState]:
     repo = repository.expanduser().resolve()
     if not repo.is_dir():

@@ -10,6 +10,7 @@ from workflow_orchestrator.approval import ApprovalAction
 from workflow_orchestrator.approval_service import (
     ApprovalCommandError,
     finalize_approval_decision,
+    handle_gigacode_result,
     record_approval_decision,
     request_approval,
 )
@@ -160,6 +161,49 @@ class ApprovalServiceTests(unittest.TestCase):
         record_approval_decision(self.repo, "feature", decision="reject")
         with self.assertRaisesRegex(ApprovalCommandError, "already has a recorded decision"):
             record_approval_decision(self.repo, "feature", decision="approve")
+
+    def test_gigacode_permission_denial_persists_session_and_waits_for_approval(self):
+        from types import SimpleNamespace
+        self._create_running_state()
+        result = SimpleNamespace(
+            ok=False,
+            is_error=False,
+            session_id="session-123",
+            error="GigaCode denied permission for: write_file",
+            permission_denials=({
+                "tool_name": "write_file",
+                "tool_use_id": "tool-1",
+                "tool_input": {"file_path": "/repo/src/App.java", "content": "x"},
+            },),
+        )
+        report = handle_gigacode_result(self.repo, "feature", result)
+        self.assertTrue(report["approval_required"])
+        self.assertEqual(report["state"]["status"], WorkflowStatus.WAITING_FOR_APPROVAL.value)
+        self.assertEqual(report["state"]["gigacode_session_id"], "session-123")
+        self.assertEqual(report["state"]["pending_approval"]["action"], "file-edit")
+        self.assertEqual(report["permission_denials"][0]["tool_name"], "write_file")
+
+    def test_gigacode_success_result_is_persisted_without_false_approval(self):
+        from types import SimpleNamespace
+        self._create_running_state()
+        result = SimpleNamespace(
+            ok=True, is_error=False, session_id="session-456", error=None, permission_denials=()
+        )
+        report = handle_gigacode_result(self.repo, "feature", result)
+        self.assertFalse(report["needs_approval"])
+        state = self.store.load("feature")
+        self.assertEqual(state.gigacode_session_id, "session-456")
+        self.assertEqual(state.last_result["kind"], "gigacode_turn")
+
+    def test_gigacode_denial_from_non_active_workflow_is_rejected(self):
+        from types import SimpleNamespace
+        start_workflow(self.repo, "feature")
+        result = SimpleNamespace(
+            ok=False, is_error=False, session_id="session-789", error="denied",
+            permission_denials=({"tool_name": "write_file", "tool_input": {}},),
+        )
+        with self.assertRaisesRegex(ApprovalCommandError, "only be handled"):
+            handle_gigacode_result(self.repo, "feature", result)
 
 
 if __name__ == "__main__":
