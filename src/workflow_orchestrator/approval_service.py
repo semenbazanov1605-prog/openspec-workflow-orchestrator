@@ -345,3 +345,121 @@ def _load_state(repository: Path, change_id: str) -> tuple[Path, StateStore, Wor
             f"{state.repository_path} (requested {repo})"
         )
     return repo, store, state
+
+
+def resume_after_approval(
+    repository: Path,
+    change_id: str,
+    *,
+    prompt: str,
+    approval_mode: str = "default",
+    adapter: Any | None = None,
+) -> dict[str, Any]:
+    """Consume an approved decision and resume its GigaCode session.
+
+    The permission mode is explicit. It defaults to ``default`` and never
+    escalates automatically. If the resumed turn is denied again, a fresh
+    approval request is persisted by ``handle_gigacode_result``.
+    """
+    from workflow_orchestrator.adapters.gigacode import GigaCodeAdapter
+
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ApprovalCommandError("Resume prompt must not be empty")
+    if approval_mode not in {"default", "plan", "auto-edit"}:
+        raise ApprovalCommandError("approval_mode must be one of: default, plan, auto-edit")
+
+    repo, store, state = _load_state(repository, change_id)
+    pending = state.pending_approval
+    if state.status is not WorkflowStatus.WAITING_FOR_APPROVAL or pending is None:
+        raise ApprovalCommandError("Workflow has no pending approval request")
+    if pending.get("decision") != "approve":
+        raise ApprovalCommandError("A recorded 'approve' decision is required to resume GigaCode")
+    session_id = state.gigacode_session_id
+    if not session_id:
+        raise ApprovalCommandError("Cannot resume GigaCode: no session_id was persisted")
+
+    # Validate the persisted action and re-check policy before changing state.
+    try:
+        action = ApprovalAction(pending["action"])
+        resume_status = WorkflowStatus(pending["resume_status"])
+    except (KeyError, ValueError) as exc:
+        raise ApprovalCommandError("Persisted approval request is invalid") from exc
+    policy = evaluate_action(state.approval_mode, action)
+    if policy.outcome is ApprovalOutcome.DENY:
+        raise ApprovalCommandError(
+            f"Cannot resume this action in '{state.approval_mode.value}' mode: {policy.reason}"
+        )
+
+    resumed_state = transition(
+        state,
+        resume_status,
+        next_action="Human approval recorded; resuming the saved GigaCode session.",
+    )
+    resumed_state.pending_approval = None
+    resumed_state.updated_at = utc_now()
+    resumed_state.last_result = {
+        "kind": "approval_resume_started",
+        "request_id": pending.get("request_id"),
+        "decision": "approve",
+        "session_id": session_id,
+        "approval_mode": approval_mode,
+    }
+    try:
+        store.save(
+            resumed_state,
+            event_type="gigacode_resume_started",
+            details={
+                "request_id": pending.get("request_id"),
+                "session_id": session_id,
+                "approval_mode": approval_mode,
+            },
+        )
+    except (StateStoreError, OSError) as exc:
+        raise ApprovalCommandError(str(exc)) from exc
+
+    executor = adapter or GigaCodeAdapter()
+    try:
+        result = executor.resume_prompt(
+            repo, session_id, prompt.strip(), approval_mode=approval_mode
+        )
+    except Exception as exc:
+        # Do not pretend the execution succeeded. Keep the active workflow
+        # recoverable and record the adapter failure for diagnostics.
+        _, current_store, current_state = _load_state(repo, change_id)
+        current_state.last_result = {
+            "kind": "gigacode_resume_error",
+            "session_id": session_id,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        current_state.next_action = "Inspect the CLI error before retrying the saved session."
+        current_state.updated_at = utc_now()
+        try:
+            current_store.save(
+                current_state,
+                event_type="gigacode_resume_failed",
+                details={"session_id": session_id, "error": str(exc)},
+            )
+        except (StateStoreError, OSError) as save_exc:
+            raise ApprovalCommandError(str(save_exc)) from save_exc
+        raise ApprovalCommandError(f"GigaCode resume failed: {exc}") from exc
+
+    report = handle_gigacode_result(repo, change_id, result)
+    report["resume_attempted"] = True
+    report["resumed_session_id"] = session_id
+    report["approval_mode"] = approval_mode
+    if getattr(result, "permission_denials", ()):
+        report["notice"] = (
+            "The resumed session was denied again. A new approval request was recorded; "
+            "no automatic permission escalation was performed."
+        )
+    elif not getattr(result, "ok", False):
+        report["notice"] = (
+            "The resumed GigaCode turn did not complete successfully. Inspect the stored result "
+            "before deciding whether to retry."
+        )
+    else:
+        report["notice"] = (
+            "GigaCode resumed the saved session. Review the resulting diff and run workflow verification; "
+            "a successful CLI result alone does not prove the change is correct."
+        )
+    return report
