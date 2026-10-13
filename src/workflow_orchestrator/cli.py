@@ -8,6 +8,9 @@ from typing import Sequence
 from workflow_orchestrator import __version__
 from workflow_orchestrator.approval_service import ApprovalCommandError, record_approval_decision
 from workflow_orchestrator.models import ApprovalMode
+from workflow_orchestrator.execution_service import (
+    ExecutionCommandError, execute_gigacode, resume_gigacode,
+)
 from workflow_orchestrator.doctor import run_doctor
 from workflow_orchestrator.workflow_service import (
     WorkflowCommandError,
@@ -55,6 +58,22 @@ def main(argv: Sequence[str] | None = None) -> None:
     approval.add_argument("--decision", required=True, choices=("approve", "reject"))
     approval.add_argument("--note", help="Optional explanation for the decision")
 
+    run = subparsers.add_parser("run", help="Execute a prompt with GigaCode for an initialized workflow")
+    run.add_argument("change_id", help="OpenSpec change ID")
+    _add_repo_argument(run)
+    run.add_argument("--prompt", required=True, help="Task prompt to send to GigaCode")
+    run.add_argument("--gigacode-executable", default="gigacode", help="GigaCode executable name")
+    run.add_argument("--gigacode-approval-mode", choices=[mode.value for mode in ApprovalMode], default="default", help="Explicit GigaCode CLI permission mode; never escalated automatically")
+    run.add_argument("--timeout", type=int, default=1800, help="GigaCode timeout in seconds")
+
+    resume = subparsers.add_parser("resume", help="Consume a recorded approval decision and resume GigaCode")
+    resume.add_argument("change_id", help="OpenSpec change ID waiting for approval")
+    _add_repo_argument(resume)
+    resume.add_argument("--prompt", help="Optional continuation prompt")
+    resume.add_argument("--gigacode-executable", default="gigacode", help="GigaCode executable name")
+    resume.add_argument("--gigacode-approval-mode", choices=[mode.value for mode in ApprovalMode], default="default", help="Explicit GigaCode CLI permission mode; never escalated automatically")
+    resume.add_argument("--timeout", type=int, default=1800, help="GigaCode timeout in seconds")
+
     status = subparsers.add_parser("status", help="Show the persisted status of a workflow run")
     status.add_argument("change_id", nargs="?", help="OpenSpec change ID; omitted when exactly one run exists")
     _add_repo_argument(status)
@@ -86,17 +105,33 @@ def main(argv: Sequence[str] | None = None) -> None:
                 decision=args.decision,
                 note=args.note,
             )
+        elif args.command == "run":
+            report = execute_gigacode(
+                args.repo, args.change_id, args.prompt,
+                gigacode_executable=args.gigacode_executable,
+                gigacode_approval_mode=args.gigacode_approval_mode,
+                timeout=args.timeout,
+            )
+        elif args.command == "resume":
+            report = resume_gigacode(
+                args.repo, args.change_id, args.prompt,
+                gigacode_executable=args.gigacode_executable,
+                gigacode_approval_mode=args.gigacode_approval_mode,
+                timeout=args.timeout,
+            )
         elif args.command == "status":
             report = get_workflow_status(args.repo, args.change_id, include_events=args.events)
         else:  # Defensive; argparse requires a known command.
             parser.error(f"Unsupported command: {args.command}")
             return
-    except (WorkflowCommandError, ApprovalCommandError, OSError) as exc:
+    except (WorkflowCommandError, ApprovalCommandError, ExecutionCommandError, OSError) as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, indent=2, ensure_ascii=False))
         raise SystemExit(1) from exc
 
     print(json.dumps(report, indent=2, ensure_ascii=False))
     if args.command == "start" and not report.get("created", False):
+        raise SystemExit(1)
+    if args.command in {"run", "resume"} and report.get("execution") == "failed":
         raise SystemExit(1)
     raise SystemExit(0)
 
