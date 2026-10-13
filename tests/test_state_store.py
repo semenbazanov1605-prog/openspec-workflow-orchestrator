@@ -72,6 +72,16 @@ class StateStoreTests(unittest.TestCase):
         data = json.loads(self.store.state_path(self.state.change_id).read_text(encoding="utf-8"))
         self.assertEqual(data["schema_version"], 1)
         self.assertEqual(data["change_id"], self.state.change_id)
+        self.assertEqual(data["approval_mode"], "default")
+        self.assertIsNone(data["pending_approval"])
+
+    def test_legacy_state_without_approval_fields_loads_with_safe_defaults(self):
+        legacy = self.state.to_dict()
+        legacy.pop("approval_mode")
+        legacy.pop("pending_approval")
+        loaded = type(self.state).from_dict(legacy)
+        self.assertEqual(loaded.approval_mode.value, "default")
+        self.assertIsNone(loaded.pending_approval)
 
 
 if __name__ == "__main__":

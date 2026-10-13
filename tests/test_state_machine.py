@@ -31,6 +31,13 @@ class WorkflowStateMachineTests(unittest.TestCase):
         completed = transition(verifying, WorkflowStatus.COMPLETED)
         self.assertEqual(completed.phase, WorkflowPhase.DONE)
 
+    def test_running_can_wait_for_approval_without_losing_phase(self):
+        running = transition(self.state, WorkflowStatus.RUNNING)
+        waiting = transition(running, WorkflowStatus.WAITING_FOR_APPROVAL)
+        self.assertEqual(waiting.status, WorkflowStatus.WAITING_FOR_APPROVAL)
+        self.assertEqual(waiting.phase, WorkflowPhase.IMPLEMENT)
+        self.assertIn(WorkflowStatus.RUNNING, allowed_transitions(waiting.status))
+
     def test_invalid_transition_is_rejected(self):
         with self.assertRaises(InvalidTransitionError):
             transition(self.state, WorkflowStatus.COMPLETED)

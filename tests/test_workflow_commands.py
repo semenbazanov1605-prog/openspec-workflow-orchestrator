@@ -4,14 +4,24 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from workflow_orchestrator.models import WorkflowPhase, WorkflowStatus
+from workflow_orchestrator.models import ApprovalMode, WorkflowPhase, WorkflowStatus
 from workflow_orchestrator.state_store import StateStore
 from workflow_orchestrator.workflow_service import (
     WorkflowCommandError,
     get_workflow_status,
     start_workflow,
 )
+
+
+PASSING_PREFLIGHT = {
+    "repo": "/repo",
+    "change_id": "add-feature",
+    "overall_ok": True,
+    "items": [{"name": "all_checks", "ok": True, "summary": "ok", "details": None}],
+    "note": "test preflight",
+}
 
 
 class WorkflowCommandTests(unittest.TestCase):
@@ -25,8 +35,14 @@ class WorkflowCommandTests(unittest.TestCase):
         (self.repo / "README.md").write_text("test repository\n", encoding="utf-8")
         self._git("add", "README.md")
         self._git("commit", "-m", "initial commit")
+        self.preflight_patcher = patch(
+            "workflow_orchestrator.workflow_service.run_doctor",
+            return_value=PASSING_PREFLIGHT,
+        )
+        self.mock_preflight = self.preflight_patcher.start()
 
     def tearDown(self) -> None:
+        self.preflight_patcher.stop()
         self.temp.cleanup()
 
     def _git(self, *args: str) -> str:
@@ -38,17 +54,42 @@ class WorkflowCommandTests(unittest.TestCase):
             raise AssertionError(f"git {' '.join(args)} failed: {result.stderr}")
         return result.stdout.strip()
 
-    def test_start_persists_ready_state_and_baseline(self) -> None:
+    def test_start_persists_ready_state_and_baseline_after_preflight(self) -> None:
         result = start_workflow(self.repo, "add-feature")
         self.assertTrue(result["created"])
         self.assertFalse(result["execution_started"])
+        self.assertTrue(result["preflight"]["overall_ok"])
         self.assertEqual(result["state"]["status"], WorkflowStatus.READY.value)
         self.assertEqual(result["state"]["phase"], WorkflowPhase.PREFLIGHT.value)
+        self.assertEqual(result["state"]["approval_mode"], ApprovalMode.DEFAULT.value)
         self.assertTrue(result["baseline_worktree_clean"])
         self.assertEqual(result["state"]["baseline_git_head"], self._git("rev-parse", "HEAD"))
+        self.assertEqual(result["state"]["last_result"]["kind"], "preflight")
         loaded = StateStore(self.repo).load("add-feature")
         self.assertEqual(loaded.run_id, result["state"]["run_id"])
         self.assertEqual(StateStore(self.repo).read_events("add-feature")[-1]["event_type"], "run_created")
+        self.mock_preflight.assert_called_once()
+
+    def test_start_persists_selected_approval_mode(self) -> None:
+        result = start_workflow(self.repo, "add-feature", approval_mode=ApprovalMode.AUTO_EDIT)
+        self.assertEqual(result["state"]["approval_mode"], "auto-edit")
+        self.assertEqual(StateStore(self.repo).load("add-feature").approval_mode, ApprovalMode.AUTO_EDIT)
+
+    def test_start_rejects_unknown_approval_mode(self) -> None:
+        with self.assertRaisesRegex(WorkflowCommandError, "--approval-mode must be one of"):
+            start_workflow(self.repo, "add-feature", approval_mode="unsafe-all")
+
+    def test_start_does_not_create_state_when_preflight_fails(self) -> None:
+        self.mock_preflight.return_value = {
+            **PASSING_PREFLIGHT,
+            "overall_ok": False,
+            "items": [{"name": "openspec_cli", "ok": False, "summary": "not found", "details": None}],
+        }
+        result = start_workflow(self.repo, "add-feature")
+        self.assertFalse(result["created"])
+        self.assertIsNone(result["state"])
+        self.assertIn("Preflight failed", result["error"])
+        self.assertFalse(StateStore(self.repo).state_path("add-feature").exists())
 
     def test_runtime_state_is_ignored_by_git_without_touching_tracked_gitignore(self) -> None:
         result = start_workflow(self.repo, "add-feature")
@@ -62,7 +103,6 @@ class WorkflowCommandTests(unittest.TestCase):
         self.assertFalse(result["baseline_worktree_clean"])
         self.assertTrue(result["warnings"])
         self.assertIn("README.md", result["state"]["baseline_git_status"])
-        # Runtime data remains excluded even when a pre-existing change exists.
         status = self._git("status", "--porcelain")
         self.assertIn("README.md", status)
         self.assertNotIn(".workflow", status)

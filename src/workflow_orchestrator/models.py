@@ -20,11 +20,20 @@ class WorkflowStatus(StrEnum):
     READY = "READY"
     RUNNING = "RUNNING"
     VERIFYING = "VERIFYING"
+    WAITING_FOR_APPROVAL = "WAITING_FOR_APPROVAL"
     RETRY_PENDING = "RETRY_PENDING"
     PAUSED = "PAUSED"
     INTERRUPTED = "INTERRUPTED"
     FAILED = "FAILED"
     COMPLETED = "COMPLETED"
+
+
+class ApprovalMode(StrEnum):
+    """Orchestrator policy for actions proposed by the executor."""
+
+    DEFAULT = "default"
+    AUTO_EDIT = "auto-edit"
+    PLAN = "plan"
 
 
 class WorkflowPhase(StrEnum):
@@ -46,6 +55,8 @@ class WorkflowState:
     schema_version: int = STATE_SCHEMA_VERSION
     attempt_count: int = 0
     max_attempts: int = 2
+    approval_mode: ApprovalMode = ApprovalMode.DEFAULT
+    pending_approval: dict[str, Any] | None = None
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
     baseline_git_head: str | None = None
@@ -67,6 +78,14 @@ class WorkflowState:
             raise ValueError("attempt_count must be >= 0")
         if self.max_attempts < 1:
             raise ValueError("max_attempts must be >= 1")
+        if not isinstance(self.approval_mode, ApprovalMode):
+            try:
+                self.approval_mode = ApprovalMode(self.approval_mode)
+            except (TypeError, ValueError) as exc:
+                allowed = ", ".join(mode.value for mode in ApprovalMode)
+                raise ValueError(f"approval_mode must be one of: {allowed}") from exc
+        if self.pending_approval is not None and not isinstance(self.pending_approval, dict):
+            raise ValueError("pending_approval must be a JSON object or null")
 
     @classmethod
     def new(
@@ -75,6 +94,7 @@ class WorkflowState:
         change_id: str,
         repository_path: str,
         max_attempts: int = 2,
+        approval_mode: ApprovalMode | str = ApprovalMode.DEFAULT,
         baseline_git_head: str | None = None,
         baseline_git_status: str | None = None,
     ) -> "WorkflowState":
@@ -84,6 +104,7 @@ class WorkflowState:
             change_id=change_id,
             repository_path=repository_path,
             max_attempts=max_attempts,
+            approval_mode=ApprovalMode(approval_mode),
             baseline_git_head=baseline_git_head,
             baseline_git_status=baseline_git_status,
             created_at=now,
@@ -101,6 +122,8 @@ class WorkflowState:
             "phase": self.phase.value,
             "attempt_count": self.attempt_count,
             "max_attempts": self.max_attempts,
+            "approval_mode": self.approval_mode.value,
+            "pending_approval": self.pending_approval,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "baseline_git_head": self.baseline_git_head,
@@ -125,6 +148,8 @@ class WorkflowState:
                 phase=WorkflowPhase(data["phase"]),
                 attempt_count=int(data.get("attempt_count", 0)),
                 max_attempts=int(data.get("max_attempts", 2)),
+                approval_mode=ApprovalMode(data.get("approval_mode", ApprovalMode.DEFAULT.value)),
+                pending_approval=data.get("pending_approval"),
                 created_at=str(data["created_at"]),
                 updated_at=str(data["updated_at"]),
                 baseline_git_head=data.get("baseline_git_head"),

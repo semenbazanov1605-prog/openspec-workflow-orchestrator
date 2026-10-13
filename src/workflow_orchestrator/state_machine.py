@@ -19,6 +19,7 @@ _ALLOWED_TRANSITIONS: dict[WorkflowStatus, frozenset[WorkflowStatus]] = {
             WorkflowStatus.VERIFYING,
             WorkflowStatus.RETRY_PENDING,
             WorkflowStatus.PAUSED,
+            WorkflowStatus.WAITING_FOR_APPROVAL,
             WorkflowStatus.INTERRUPTED,
             WorkflowStatus.FAILED,
         }
@@ -27,6 +28,16 @@ _ALLOWED_TRANSITIONS: dict[WorkflowStatus, frozenset[WorkflowStatus]] = {
         {
             WorkflowStatus.COMPLETED,
             WorkflowStatus.RETRY_PENDING,
+            WorkflowStatus.PAUSED,
+            WorkflowStatus.WAITING_FOR_APPROVAL,
+            WorkflowStatus.INTERRUPTED,
+            WorkflowStatus.FAILED,
+        }
+    ),
+    WorkflowStatus.WAITING_FOR_APPROVAL: frozenset(
+        {
+            WorkflowStatus.RUNNING,
+            WorkflowStatus.VERIFYING,
             WorkflowStatus.PAUSED,
             WorkflowStatus.INTERRUPTED,
             WorkflowStatus.FAILED,
